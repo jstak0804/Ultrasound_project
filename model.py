@@ -304,61 +304,68 @@ class SpatialAttention(nn.Module):
 
 
         
-class CustomModel(nn.Module): #(Original)
+class CustomModel(nn.Module):
     def __init__(self, num_classes):
         super(CustomModel, self).__init__()
-        # ResNet50 Backbone (Feature Extractor)
-        # densenet = models.densenet121(pretrained=True)
-
-        resnet = models.resnet50(pretrained=True)
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # Remove FC layer and AvgPool
         
-        # Conv2D Layer
+        # 1. ResNet50 Backbone (Feature Extractor)
+        resnet = models.resnet50(pretrained=True)
+        # ResNet의 Convolutional layers만 남깁니다.
+        # list(resnet.children())[:-2]는 ResNet의 마지막 Conv Block (layer4)까지 포함합니다.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2]) 
+        
+        # 2. Convolution Layer (2048 -> 1024 채널 축소)
         self.conv2d = nn.Conv2d(2048, 1024, kernel_size=3, stride=1, padding=1)
         
-        # SEBlock
+        # 3. Attention Modules
         self.se_block = SEBlock(1024)
-        
-        # Channel Attention
         self.channel_attention = ChannelAttention(1024)
         
-        # Spatial Attention
-        self.spatial_attention = SpatialAttention()
+        # [수정됨] Spatial Attention은 병렬 경로 *이후* 최종 Feature Map에 적용합니다.
+        # *순서 변경:* Spatial Attention은 병렬 경로 Concatenation 이후의 차원(2048)에 맞춰야 합니다.
+        # 하지만 기존 코드는 병렬 경로 *전*의 1024 채널 모듈을 정의하고 있으므로, 
+        # Spatial Attention은 Concatenation *이후*에 적용하는 것이 더 자연스럽습니다.
+        self.spatial_attention = SpatialAttention() 
         
-        # Global Average Pooling
+        # 4. Global Average Pooling
         self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
         
-        # Fully Connected Layer
-        self.fc = nn.Linear(1024 * 2, num_classes)  # Adjusted for concatenation of branch1 and branch2
+        # 5. Fully Connected Layer
+        # [수정됨] 병렬 경로(branch1: 1024, branch2: 1024)를 Concatenate하면 2048 채널이 됩니다.
+        # 따라서 FC Layer의 입력 차원은 2048입니다.
+        self.fc = nn.Linear(2048, num_classes) # 1024 * 2 = 2048
     
     def forward(self, x):
-        # Backbone (ResNet50)
-        x = self.backbone(x)  # Output: [Batch, 2048, 7, 7]
+        # 1. Backbone (ResNet50)
+        x = self.backbone(x)  # Output: [Batch, 2048, 7, 7] (Input 224x224 기준)
         
-        # Conv2D
+        # 2. Conv2D
         x = self.conv2d(x)  # Output: [Batch, 1024, 7, 7]
         
-        # Parallel Pathways
-        branch1 = self.se_block(self.channel_attention(x))  # SE -> Channel Attention
-        branch2 = self.channel_attention(self.se_block(x))  # Channel Attention -> SE
+        # 3. Parallel Pathways (입력: [B, 1024, H, W])
+        # [Branch 1] SE -> Channel Attention
+        branch1 = self.channel_attention(self.se_block(x)) # Output: [B, 1024, H, W]
+        # [Branch 2] Channel Attention -> SE
+        branch2 = self.se_block(self.channel_attention(x)) # Output: [B, 1024, H, W]
         
-        # Concatenate Parallel Pathways
-        x = torch.cat([branch1, branch2], dim=1)  # Output: [Batch, 2048, 7, 7] after concat
+        # 4. Concatenate Parallel Pathways
+        # [수정됨] 두 브랜치를 Concatenate합니다. 1024 + 1024 = 2048 채널.
+        x = torch.cat([branch1, branch2], dim=1)  # Output: [Batch, 2048, 7, 7]
         
-        # Spatial Attention
+        # 5. Spatial Attention (Concatenation 이후 Feature Map에 적용)
+        # [참고] Spatial Attention은 입력 채널 수와 무관하게 작동하는 경우가 많습니다.
         x = self.spatial_attention(x)  # Output: [Batch, 2048, 7, 7]
         
-        # Global Average Pooling
+        # 6. Global Average Pooling
         x = self.global_avg_pool(x)  # Output: [Batch, 2048, 1, 1]
         
-        # Flatten before feeding to FC layer
+        # 7. Flatten
         x = torch.flatten(x, 1)  # Output: [Batch, 2048]
         
-        # Fully Connected Layer
+        # 8. Fully Connected Layer
         x = self.fc(x)  # Output: [Batch, num_classes]
         
         return x
-
 # class 3BranchNet(nn.Module):
 #     def __init__(self, num_classes):
 #         super(CustomModel2, self).__init__()

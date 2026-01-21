@@ -8,33 +8,37 @@ import torch
 import random
 import matplotlib.pyplot as plt
 import datetime
+import warnings
+
+# 경고 메시지 무시
+warnings.filterwarnings("ignore")
 
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
-from torchmetrics.classification import F1Score, Precision, Recall, ConfusionMatrix
-from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, ConfusionMatrixDisplay
+from torchmetrics.classification import F1Score, Precision, Recall
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 
-# 사용 중인 사용자 정의 함수 및 모델 import
-from functions_for_train import find_image_sizes, EarlyStopping, calculate_optimal_size, get_unique_filename, save_results_to_csv
-from model import EnhancedResNet, CustomModel
-from Grad_Cam import log_gradcam_examples, log_gradcam_to_wandb, overlay_heatmap_on_image, generate_gradcam_heatmap, visualize_cam, show_cam_on_image, GradCAM
+# [중요] model.py가 같은 폴더에 있어야 합니다.
+from model import CustomModel 
 
-# device 설정
+# Device 설정
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Clear GPU cache
+# GPU Cache 정리
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
-    for i in range(torch.cuda.device_count()):
-        torch.cuda.set_device(i)
-        torch.cuda.empty_cache()
 
-# 랜덤 시드 고정 함수
+# ---------------------------------------------------------
+# 1. Helper Functions & Classes
+# ---------------------------------------------------------
+
 def set_seed(random_seed):
+    """재현성을 위한 시드 고정"""
     torch.manual_seed(random_seed)
     torch.cuda.manual_seed(random_seed)
     torch.cuda.manual_seed_all(random_seed)
@@ -43,189 +47,149 @@ def set_seed(random_seed):
     np.random.seed(random_seed)
     random.seed(random_seed)
 
-# ----------------------
-# 결과 저장 폴더 생성 함수 (현재 날짜와 모델명을 이용)
 def create_result_dir(model_name, base_dir="Result"):
+    """결과 저장 폴더 생성"""
     date_str = datetime.datetime.now().strftime('%Y-%m-%d')
     result_dir = os.path.join(base_dir, date_str, model_name)
     os.makedirs(result_dir, exist_ok=True)
     return result_dir
 
-# ----------------------
-# Argument Parser Setup
-random_seeds = random.sample(range(1, 3000), 20)
+def save_results_to_csv(results, filename, columns=None):
+    """학습 로그 CSV 저장"""
+    if columns is None:
+        columns = [
+            "Epoch", 
+            "Train Loss", "Train Accuracy", "Train F1", "Train Precision", "Train Recall",
+            "Val Loss", "Val Accuracy", "Val F1", "Val Precision", "Val Recall"
+        ]
+    results_df = pd.DataFrame(results, columns=columns)
+    if os.path.exists(filename):
+        results_df.to_csv(filename, mode='a', header=False, index=False)
+    else:
+        results_df.to_csv(filename, index=False)
 
-parser = argparse.ArgumentParser(description='Train a ResNet model with CBAM for ORS classification.')
-parser.add_argument('--epochs', type=int, default=30, help='Number of epochs to train')
-parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training, set to -1 for auto allocation')
-parser.add_argument('--pretrained_weights', type=str, default=None, help='Path to pretrained weights (.pth file)')
-parser.add_argument('--seeds', nargs='+', type=int, default=[24], help='List of seeds to try for best result')
-args = parser.parse_args()
+# ---------------------------------------------------------
+# 2. EarlyStopping Class (직접 정의)
+# ---------------------------------------------------------
+class EarlyStopping:
+    """Validation Loss가 더 이상 줄어들지 않으면 학습 중단"""
+    def __init__(self, patience=7, verbose=False, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
 
-# WandB 초기화
-wandb.init(project="US_classification_seed_changing", entity="ddurbozak")
-wandb.config.update({"learning_rate": 1e-5, "epochs": args.epochs, "batch_size": args.batch_size})
+    def __call__(self, val_loss, model):
+        score = -val_loss
 
-# 모델명을 지정하고 결과 폴더 생성 (원하는 모델 이름으로 수정 가능)
-model_name = "CustomModel"
-result_dir = create_result_dir(model_name)
-print("Results will be saved in:", result_dir)
+        if self.best_score is None:
+            self.best_score = score
+            self.val_loss_min = val_loss
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.val_loss_min = val_loss
+            self.counter = 0 # 개선됨 -> 초기화
 
-# ----------------------
-# 데이터 전처리 및 로더 설정
+# ---------------------------------------------------------
+# 3. Grad-CAM Class & Visualization
+# ---------------------------------------------------------
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        self.target_layer.register_forward_hook(self.save_activation)
+        self.target_layer.register_forward_hook(self.save_gradient_hook)
 
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),  # 좌우 반전
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+    def save_activation(self, module, input, output):
+        self.activations = output
 
-test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+    def save_gradient_hook(self, module, input, output):
+        if not hasattr(output, "requires_grad") or not output.requires_grad:
+            return
+        def _store_grad(grad):
+            self.gradients = grad
+        output.register_hook(_store_grad)
 
-train_path = "Liver_US/train_2"
-test_path = "Liver_US/test_2"
+    def __call__(self, input_tensor):
+        self.model.zero_grad()
+        output = self.model(input_tensor)
+        targets = torch.argmax(output, dim=1)
+            
+        one_hot_output = torch.zeros_like(output)
+        for i in range(len(targets)):
+            one_hot_output[i][targets[i]] = 1
+            
+        output.backward(gradient=one_hot_output, retain_graph=True)
+        
+        weights = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = F.relu(cam)
+        cam = F.interpolate(cam, size=(input_tensor.shape[2], input_tensor.shape[3]), mode='bilinear', align_corners=False)
+        
+        cam = cam.detach().cpu().numpy()
+        result_cams = []
+        for i in range(len(cam)):
+            c = cam[i, 0, :, :]
+            if np.max(c) > np.min(c):
+                c = (c - np.min(c)) / (np.max(c) - np.min(c))
+            else:
+                c = np.zeros_like(c)
+            result_cams.append(c)
+        return np.array(result_cams)
 
-train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
-test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
+def show_cam_on_image(img, mask):
+    """히트맵 시각화"""
+    heatmap = plt.get_cmap('jet')(mask)[..., :3]
+    heatmap = np.float32(heatmap)
+    cam = 0.5 * heatmap + 0.5 * img
+    cam = cam / np.max(cam)
+    return np.uint8(255 * cam)
 
-batch_size = args.batch_size if args.batch_size != -1 else len(train_dataset) // 100
-
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
-dataloaders = {'train': train_dataloader, 'test': test_dataloader}
-
-# Metric 초기화 (테스트 시 사용)
-precision_metric = Precision(num_classes=2, average='macro', task='multiclass').to(device)
-recall_metric = Recall(num_classes=2, average='macro', task='multiclass').to(device)
-confusion_metric = ConfusionMatrix(num_classes=2, task="multiclass").to(device)
-
-# ----------------------
-# 학습 함수 정의
-def train(model, dataloader, criterion, optimizer):
-    model.train()
-    running_loss, correct_predictions = 0.0, 0
-    f1_metric = F1Score(num_classes=2, average='macro', task='multiclass').to(device)
-    precision_metric = Precision(num_classes=2, average='macro', task='multiclass').to(device)
-    recall_metric = Recall(num_classes=2, average='macro', task='multiclass').to(device)
-
-    for inputs, labels in tqdm(dataloader, desc="Training", unit="batch"):
-        inputs, labels = inputs.to(device), labels.to(device)
-        optimizer.zero_grad()
-
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        _, preds = torch.max(outputs, 1)
-
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss.item() * inputs.size(0)
-        correct_predictions += torch.sum(preds == labels.data).item()
-
-        f1_metric.update(outputs, labels)
-        precision_metric.update(outputs, labels)
-        recall_metric.update(outputs, labels)
-
-    epoch_loss = running_loss / len(dataloader.dataset)
-    epoch_acc = correct_predictions / len(dataloader.dataset)
-    epoch_f1 = f1_metric.compute()
-    epoch_precision = precision_metric.compute()
-    epoch_recall = recall_metric.compute()
-
-    wandb.log({
-        "Train Loss": epoch_loss,
-        "Train Accuracy": epoch_acc,
-        "Train F1": epoch_f1.item(),
-        "Train Precision": epoch_precision.item(),
-        "Train Recall": epoch_recall.item()
-    })
-
-    return epoch_loss, epoch_acc, epoch_f1, epoch_precision, epoch_recall
-
-# ----------------------
-# 테스트 함수 정의
-def test(model, test_dataloader, criterion):
-    model.eval()
-    running_loss = 0.0
-    correct_predictions = 0
-    all_preds = []
-    all_labels = []
-
-    with torch.no_grad():
-        for inputs, labels in tqdm(test_dataloader, desc="Testing", unit="batch"):
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-
-            _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-            running_loss += loss.item() * inputs.size(0)
-            correct_predictions += torch.sum(preds == labels.data).item()
-            print(f"Batch Loss: {loss.item():.4f}, Precision: {precision_metric.compute():.4f}, Recall: {recall_metric.compute():.4f}")
-
-    test_loss = running_loss / len(test_dataloader.dataset)
-    test_acc = correct_predictions / len(test_dataloader.dataset)
-
-    test_f1 = f1_score(all_labels, all_preds, average='macro')
-    test_precision = precision_score(all_labels, all_preds, average='macro')
-    test_recall = recall_score(all_labels, all_preds, average='macro')
-
-    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1, 2])
-    print("Confusion Matrix:\n", cm)
-
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Normal", "Benign", "Malignant"])
-    disp.plot(cmap="viridis")
-    plt.pause(10)
-    plt.close()
-
-    wandb.log({
-        "Test Loss": test_loss,
-        "Test Accuracy": test_acc,
-        "Test F1": test_f1,
-        "Test Precision": test_precision,
-        "Test Recall": test_recall
-    })
-
-    return test_loss, test_acc, test_f1, test_precision, test_recall
-
-# ----------------------
-# 학습과 평가를 진행하는 함수 (Epoch마다 Confusion Matrix 저장 포함)
-def train_and_evaluate_model(model, dataloaders, criterion, optimizer, num_epochs=25):
+# ---------------------------------------------------------
+# 4. Main Training Function
+# ---------------------------------------------------------
+def train_model(model, dataloaders, criterion, optimizer, seed, result_dir, num_epochs=25, num_classes=2):
     results = []
-    early_stopping = EarlyStopping(patience=5, verbose=True)
-    best_test_acc, best_epoch_acc = 0.0, 0
-    best_epoch_confusion_matrix = None
-    best_f1, best_precision, best_recall = 0.0, 0.0, 0.0
+    # Patience=5 설정 (5번 개선 안되면 중단)
+    early_stopping = EarlyStopping(patience=5, verbose=True) 
+    
+    best_val_acc = 0.0
+    best_epoch_acc = 0
+    best_model_path = os.path.join(result_dir, f"best_model_seed_{seed}.pth")
 
     for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
-        epoch_metrics = {
-            'train_loss': 0.0, 'train_acc': 0.0, 'train_f1': 0.0, 'train_precision': 0.0, 'train_recall': 0.0,
-            'test_loss': 0.0, 'test_acc': 0.0, 'test_f1': 0.0, 'test_precision': 0.0, 'test_recall': 0.0
-        }
-        all_preds = []
-        all_labels = []
-
-        for phase in ['train', 'test']:
+        epoch_metrics = {}
+        
+        for phase in ['train', 'val']: 
             if phase == 'train':
                 model.train()
             else:
                 model.eval()
-            running_loss, correct_predictions = 0.0, 0
-            f1_metric = F1Score(num_classes=2, average='macro', task='multiclass').to(device)
-            precision_metric = Precision(num_classes=2, average='macro', task='multiclass').to(device)
-            recall_metric = Recall(num_classes=2, average='macro', task='multiclass').to(device)
-            all_preds_phase = []
-            all_labels_phase = []
-
-            for inputs, labels in tqdm(dataloaders[phase], desc=f"{phase.capitalize()} Epoch {epoch + 1}/{num_epochs}"):
+            
+            running_loss = 0.0
+            correct_predictions = 0
+            
+            # Metrics Init
+            metric_f1 = F1Score(num_classes=num_classes, average='macro', task='multiclass').to(device)
+            metric_precision = Precision(num_classes=num_classes, average='macro', task='multiclass').to(device)
+            metric_recall = Recall(num_classes=num_classes, average='macro', task='multiclass').to(device)
+            
+            # TQDM Progress Bar
+            pbar = tqdm(dataloaders[phase], desc=f"Epoch {epoch+1}/{num_epochs} [{phase}]", leave=True)
+            
+            for inputs, labels in pbar:
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad()
 
@@ -233,142 +197,238 @@ def train_and_evaluate_model(model, dataloaders, criterion, optimizer, num_epoch
                     outputs = model(inputs)
                     loss = criterion(outputs, labels)
                     _, preds = torch.max(outputs, 1)
+                    
                     if phase == 'train':
                         loss.backward()
                         optimizer.step()
 
-                    f1_metric.update(outputs, labels)
-                    precision_metric.update(outputs, labels)
-                    recall_metric.update(outputs, labels)
-
+                    # Metrics Update
+                    metric_f1.update(outputs, labels)
+                    metric_precision.update(outputs, labels)
+                    metric_recall.update(outputs, labels)
+                    
                     running_loss += loss.item() * inputs.size(0)
                     correct_predictions += torch.sum(preds == labels.data).item()
+                    
+                    pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-                    all_preds_phase.extend(preds.cpu().numpy())
-                    all_labels_phase.extend(labels.cpu().numpy())
-
+            # Epoch Stats
             epoch_loss = running_loss / len(dataloaders[phase].dataset)
             epoch_acc = correct_predictions / len(dataloaders[phase].dataset)
-            epoch_f1 = f1_metric.compute()
-            epoch_precision = precision_metric.compute()
-            epoch_recall = recall_metric.compute()
+            epoch_f1 = metric_f1.compute().item()
+            epoch_precision = metric_precision.compute().item()
+            epoch_recall = metric_recall.compute().item()
 
             epoch_metrics[f'{phase}_loss'] = epoch_loss
             epoch_metrics[f'{phase}_acc'] = epoch_acc
-            epoch_metrics[f'{phase}_f1'] = epoch_f1.item()
-            epoch_metrics[f'{phase}_precision'] = epoch_precision.item()
-            epoch_metrics[f'{phase}_recall'] = epoch_recall.item()
+            epoch_metrics[f'{phase}_f1'] = epoch_f1
+            epoch_metrics[f'{phase}_precision'] = epoch_precision
+            epoch_metrics[f'{phase}_recall'] = epoch_recall
 
-            if phase == 'test':
-                all_preds = all_preds_phase
-                all_labels = all_labels_phase
-
-                # Confusion Matrix 계산 및 플롯 저장
-                cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
-                print(f"Confusion Matrix for Epoch {epoch + 1}:\n", cm)
-                disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Benign", "Malignant"])
-                disp.plot(cmap=plt.cm.Blues)
-                cm_filename = os.path.join(result_dir, f"confusion_matrix_epoch_{epoch + 1}.png")
-                plt.savefig(cm_filename)
-                wandb.log({f"Confusion Matrix Epoch {epoch + 1}": wandb.Image(cm_filename)})
-                plt.close()
-
-                # best model tracking
-                if epoch_acc > best_test_acc:
-                    best_test_acc = epoch_acc
+            if phase == 'val':
+                print(f" -> Val Acc: {epoch_acc:.4f} | Loss: {epoch_loss:.4f} | F1: {epoch_f1:.4f}")
+                if epoch_acc > best_val_acc:
+                    best_val_acc = epoch_acc
                     best_epoch_acc = epoch + 1
-                    best_epoch_confusion_matrix = cm
-                    best_f1 = epoch_metrics['test_f1']
-                    best_precision = epoch_metrics['test_precision']
-                    best_recall = epoch_metrics['test_recall']
-
-            print(f"{phase.capitalize()} Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}, "
-                  f"F1 Score: {epoch_f1:.4f}, Precision: {epoch_precision:.4f}, Recall: {epoch_recall:.4f}")
+                    torch.save(model.state_dict(), best_model_path)
+                    print(f"    (Best Model Saved!)")
+            
             wandb.log({
-                f"{phase.capitalize()} Loss": epoch_loss,
-                f"{phase.capitalize()} Accuracy": epoch_acc,
-                f"{phase.capitalize()} F1": epoch_f1.item(),
-                f"{phase.capitalize()} Precision": epoch_precision.item(),
-                f"{phase.capitalize()} Recall": epoch_recall.item()
+                f"{phase} loss": epoch_loss, 
+                f"{phase} acc": epoch_acc, 
+                "epoch": epoch+1
             })
 
-        results.append([
-            epoch + 1,
-            epoch_metrics['train_loss'], epoch_metrics['train_acc'], epoch_metrics['train_f1'],
-            epoch_metrics['train_precision'], epoch_metrics['train_recall'],
-            epoch_metrics['test_loss'], epoch_metrics['test_acc'], epoch_metrics['test_f1'],
-            epoch_metrics['test_precision'], epoch_metrics['test_recall']
-        ])
-
-        # 결과를 CSV 파일로 저장 (seed 별 결과로 저장)
-        csv_filename = os.path.join(result_dir, f"results_seed_{seed}.csv")
-        save_results_to_csv(results, csv_filename)
-
-        if early_stopping(epoch_metrics['test_loss'], model):
+        # Early Stopping Check
+        early_stopping(epoch_metrics['val_loss'], model)
+        if early_stopping.early_stop:
+            print(f"\n[INFO] Early stopping triggered at Epoch {epoch+1}")
             break
 
-    print(f"\nBest Test Accuracy: {best_test_acc:.4f} at Epoch {best_epoch_acc}")
-    print(f"Confusion Matrix for Best Epoch:\n{best_epoch_confusion_matrix}")
-    return best_test_acc, best_epoch_acc, best_epoch_confusion_matrix, epoch_f1.item(), epoch_precision.item(), epoch_recall.item()
+        # Save Logs (11 Columns)
+        results.append([
+            epoch + 1,
+            epoch_metrics['train_loss'], epoch_metrics['train_acc'], epoch_metrics['train_f1'], epoch_metrics['train_precision'], epoch_metrics['train_recall'],
+            epoch_metrics['val_loss'], epoch_metrics['val_acc'], epoch_metrics['val_f1'], epoch_metrics['val_precision'], epoch_metrics['val_recall']
+        ])
+        save_results_to_csv(results, os.path.join(result_dir, f"training_log_seed_{seed}.csv"))
 
-# ----------------------
-# Confusion Matrix를 WandB에 로그하는 함수
-def log_confusion_matrix_to_wandb(all_labels, all_preds, class_names):
-    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-    fig, ax = plt.subplots(figsize=(8, 8))
-    disp.plot(cmap="viridis", ax=ax)
-    plt.title("Confusion Matrix")
-    wandb.log({"Confusion Matrix": wandb.Image(fig)})
-    plt.close(fig)
+    print(f"\nTraining Finished. Best Val Acc: {best_val_acc:.4f} at Epoch {best_epoch_acc}")
+    return best_model_path, best_epoch_acc
 
-# ----------------------
-# Main loop: 여러 seed에 대해 학습 실행 및 결과 저장
+# ---------------------------------------------------------
+# 5. Final Evaluation Function
+# ---------------------------------------------------------
+def run_final_evaluation(model, dataloader, criterion, device, num_classes):
+    model.eval()
+    running_loss, correct_predictions = 0.0, 0
+    f1_metric = F1Score(num_classes=num_classes, average='macro', task='multiclass').to(device)
+    precision_metric = Precision(num_classes=num_classes, average='macro', task='multiclass').to(device)
+    recall_metric = Recall(num_classes=num_classes, average='macro', task='multiclass').to(device)
+    
+    all_preds, all_labels = [], []
+    
+    with torch.no_grad():
+        for inputs, labels in tqdm(dataloader, desc="Final Test Evaluation"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            _, preds = torch.max(outputs, 1)
+            
+            f1_metric.update(outputs, labels)
+            precision_metric.update(outputs, labels)
+            recall_metric.update(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+            correct_predictions += torch.sum(preds == labels.data).item()
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    test_loss = running_loss / len(dataloader.dataset)
+    test_acc = correct_predictions / len(dataloader.dataset)
+    test_f1 = f1_metric.compute().item()
+    test_precision = precision_metric.compute().item()
+    test_recall = recall_metric.compute().item()
+    
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
+    return test_loss, test_acc, test_f1, test_precision, test_recall, cm
+
+# ---------------------------------------------------------
+# 6. Main Execution
+# ---------------------------------------------------------
 if __name__ == "__main__":
-    best_seed, best_accuracy = None, 0.0
-    columns = ["Seed", "Test Accuracy", "Best Epoch", "Best F1 Score", "Test Precision", "Test Recall"]
+    # Args
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--seeds', nargs='+', type=int, default=[24])
+    args = parser.parse_args()
+
+    # WandB
+    wandb.init(project="US_classification_Final_Code", entity="ddurbozak")
+    wandb.config.update(args)
+
+    model_name = "CustomModel_Final"
+    result_dir = create_result_dir(model_name)
+    print(f"Results will be saved in: {result_dir}")
+
+    # Data Paths (경로 확인 필수)
+    train_path = "train_clean"
+    val_path = "val_clean"
+    test_path = "test_clean"
+
+    # Transforms
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    print(f"\nLoading Datasets...")
+    train_dataset = datasets.ImageFolder(root=train_path, transform=train_transform)
+    val_dataset = datasets.ImageFolder(root=val_path, transform=test_transform)
+    test_dataset = datasets.ImageFolder(root=test_path, transform=test_transform)
+    
+    class_names = train_dataset.classes
+    num_classes = len(class_names)
+    print(f"Classes: {class_names} (N={num_classes})")
+
+    # Loaders
+    bs = args.batch_size if args.batch_size != -1 else 32
+    train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=bs, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=4, pin_memory=True)
+    
+    dataloaders = {'train': train_loader, 'val': val_loader}
+
     seed_results = []
 
+    # --- Seed Loop ---
     for seed in args.seeds:
-        print(f"\nTraining with Seed: {seed}")
+        print(f"\n{'='*40}\n STARTING SEED: {seed}\n{'='*40}")
         set_seed(seed)
-        model = CustomModel(num_classes=2).to(device)
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.NAdam(model.parameters(), lr=wandb.config["learning_rate"])
-
-        test_accuracy, best_epoch_acc, best_epoch_confusion_matrix, best_f1, best_precision, best_recall = \
-            train_and_evaluate_model(model, dataloaders, criterion, optimizer, num_epochs=args.epochs)
-
-        seed_results.append([seed, test_accuracy, best_epoch_acc, best_f1, best_precision, best_recall])
-
-    # Seed별 결과 출력 및 최종 CSV 저장
-    for seed, test_acc, best_epoch, best_f1, test_precision, test_recall in seed_results:
-        print(f"Seed: {seed}, Test Accuracy: {test_acc:.4f}, Best Epoch: {best_epoch}, "
-              f"F1: {best_f1:.4f}, Precision: {test_precision:.4f}, Recall: {test_recall:.4f}")
-
-    results_df = pd.DataFrame(seed_results, columns=columns)
-    overall_results_filename = os.path.join(result_dir, f"overall_seed_results_{time.strftime('%Y%m%d_%H%M%S_pararell')}.csv")
-    results_df.to_csv(overall_results_filename, index=False)
-    wandb.save(overall_results_filename)
-    print("\nTraining complete. Results saved and logged to WandB.")
-    wandb.finish()
-
-    # (옵션) Best Seed의 모델에 대해 추가 테스트 및 Confusion Matrix 로그
-    if best_seed is not None:
-        print(f"\nLogging Confusion Matrix for Best Seed: {best_seed}")
-        set_seed(best_seed)
-        best_model = CustomModel(num_classes=2).to(device)
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.NAdam(best_model.parameters(), lr=wandb.config["learning_rate"])
         
-        # 테스트 데이터로 Confusion Matrix 생성
-        all_preds, all_labels = [], []
-        best_model.eval()
-        with torch.no_grad():
-            for inputs, labels in tqdm(test_dataloader, desc="Generating Confusion Matrix"):
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = best_model(inputs)
-                _, preds = torch.max(outputs, 1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        log_confusion_matrix_to_wandb(all_labels, all_preds, class_names=["Benign", "Malignant"])
+        # Init Model
+        model = CustomModel(num_classes=num_classes).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.NAdam(model.parameters(), lr=1e-5)
+
+        # 1. Train
+        best_model_path, best_epoch = train_model(
+            model, dataloaders, criterion, optimizer, seed, result_dir, 
+            num_epochs=args.epochs, num_classes=num_classes
+        )
+
+        # 2. Final Test
+        if os.path.exists(best_model_path):
+            print(f"\n[Test] Loading Best Model (Seed {seed})...")
+            model.load_state_dict(torch.load(best_model_path))
+            
+            t_loss, t_acc, t_f1, t_prec, t_rec, t_cm = run_final_evaluation(
+                model, test_loader, criterion, device, num_classes
+            )
+            
+            seed_results.append([seed, best_epoch, t_loss, t_acc, t_f1, t_prec, t_rec])
+
+            # 3. Save Confusion Matrix
+            disp = ConfusionMatrixDisplay(confusion_matrix=t_cm, display_labels=class_names)
+            fig, ax = plt.subplots(figsize=(6, 6))
+            disp.plot(cmap="Blues", ax=ax, xticks_rotation=45)
+            plt.title(f"Confusion Matrix (Seed {seed})")
+            cm_path = os.path.join(result_dir, f"CM_Seed_{seed}.png")
+            plt.savefig(cm_path, bbox_inches='tight')
+            plt.close()
+            wandb.log({f"CM Seed {seed}": wandb.Image(cm_path)})
+
+            # 4. Grad-CAM
+            print(f"[Grad-CAM] Generating images...")
+            cam_dir = os.path.join(result_dir, f"GradCAM_Seed_{seed}")
+            os.makedirs(cam_dir, exist_ok=True)
+            
+            # Target Layer 자동 탐지 (CustomModel 구조에 맞춰 조정 필요)
+            target_layer = model.conv2d if hasattr(model, 'conv2d') else model.backbone[-1]
+            gradcam = GradCAM(model, target_layer)
+            
+            cnt = 0
+            for inputs, labels in test_loader:
+                if cnt >= 20: break
+                inputs = inputs.to(device)
+                cams = gradcam(inputs)
+                
+                for i in range(len(inputs)):
+                    if cnt >= 20: break
+                    # Denormalize
+                    img = inputs[i].cpu().permute(1, 2, 0).numpy()
+                    img = (img * np.array([0.229, 0.224, 0.225])) + np.array([0.485, 0.456, 0.406])
+                    img = np.clip(img, 0, 1)
+                    
+                    vis = show_cam_on_image(img, cams[i])
+                    
+                    gt = class_names[labels[i].item()]
+                    pred = class_names[model(inputs[i:i+1]).argmax(1).item()]
+                    fname = os.path.join(cam_dir, f"img{cnt}_GT-{gt}_Pred-{pred}.jpg")
+                    plt.imsave(fname, vis)
+                    cnt += 1
+
+            del model
+            torch.cuda.empty_cache()
+        else:
+            print("Error: Best model not found.")
+
+    # 5. Final Summary
+    print(f"\n{'='*40}\n FINAL RESULTS SUMMARY \n{'='*40}")
+    df = pd.DataFrame(seed_results, columns=["Seed", "Best Epoch", "Loss", "Acc", "F1", "Prec", "Rec"])
+    print(df.to_string(index=False))
+    
+    summary_path = os.path.join(result_dir, "final_summary_results.csv")
+    df.to_csv(summary_path, index=False)
+    wandb.save(summary_path)
+    wandb.finish()
