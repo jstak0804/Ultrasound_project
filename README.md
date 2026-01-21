@@ -1,12 +1,12 @@
-# Ultrasound_project
 # Liver Ultrasound Classification Project (Ultrasound_project)
 
 [![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-Deep%20Learning-orange.svg)](https://pytorch.org/)
+[![WandB](https://img.shields.io/badge/Weights%20%26%20Biases-Experiment%20Tracking-yellow.svg)](https://wandb.ai/)
 
 This project focuses on the **automated classification of liver tumors into benign and malignant categories** using deep learning techniques on ultrasound imagery. The core of this research lies in implementing a custom attention mechanism to capture the subtle textures and patterns characteristic of medical ultrasound data.
 
-간 초음파 영상을 분석하여 종양의 **양성(Benign) 및 악성(Malignant) 여부를 분류**하는 딥러닝 프로젝트입니다. 의료 영상의 미세한 특징을 효과적으로 포착하기 위해 설계된 커스텀 어텐션 구조를 활용합니다.
+간 초음파 영상을 분석하여 종양의 **양성(Benign) 및 악성(Malignant) 여부를 분류**하는 딥러닝 프로젝트입니다. 의료 영상의 미세한 특징을 효과적으로 포착하기 위해 설계된 커스텀 어텐션 구조와 최신 의료 인공지능 프레임워크를 활용합니다.
 
 ---
 
@@ -41,15 +41,8 @@ The `custommodel` in `model.py` is specifically designed to handle the complexit
 
 ## 🚀 Getting Started
 
-### Prerequisites
-* Python 3.x
-* PyTorch
-* OpenCV
-* NumPy
-* Scikit-learn
-* Matplotlib
-
 ### Installation
 ```bash
 git clone [https://github.com/jstak0804/Ultrasound_project.git](https://github.com/jstak0804/Ultrasound_project.git)
 cd Ultrasound_project
+pip install -r requirements.txt
